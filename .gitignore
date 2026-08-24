@@ -1,0 +1,12 @@
+# Yapi ciktilari (bu depoda zaten yok)
+node_modules/
+target/
+dist/
+
+# Ortam dosyalari ASLA depoya girmez
+.env
+.env.*
+
+.idea/
+.vscode/
+.DS_Store

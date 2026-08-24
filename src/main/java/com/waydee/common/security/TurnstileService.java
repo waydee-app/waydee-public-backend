@@ -1,0 +1,21 @@
+package com.waydee.common.security;
+
+/**
+ * <b>TurnstileService</b> — bu sinifin govdesi <b>VITRIN KOPYASINDA KALDIRILMISTIR</b>.
+ *
+ * <p>Ozgun sorumlulugu: Cloudflare Turnstile bot dogrulamasi (fail-closed).
+ *
+ * <p>Bu depo Waydee'nin <b>yalnizca inceleme amacli</b> bir kopyasidir.
+ * Kimlik dogrulama, imzalama, odeme ve sir yonetimiyle ilgili siniflarin
+ * icerigi bilerek cikarilmistir; depo <b>derlenemez ve calistirilamaz</b>
+ * (yapi dosyalari da kaldirilmistir).
+ *
+ * <p>Kaldirilan bolum yaklasik <b>93 satirdi</b>.
+ */
+public final class TurnstileService {
+
+    private TurnstileService() {
+        throw new UnsupportedOperationException(
+                "Vitrin kopyasi: bu sinifin uygulamasi yayinlanmamistir.");
+    }
+}

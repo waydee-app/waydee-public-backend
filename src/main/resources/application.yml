@@ -1,0 +1,449 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ⚠️ VİTRİN SÜRÜMÜ — bu dosya çalıştırılabilir bir yapılandırma DEĞİLDİR.
+#
+# Tüm gizli varsayılanlar (veritabanı/Redis/MinIO şifreleri, geliştirme JWT
+# anahtarı) bu kopyadan kaldırılmıştır. Değerler yalnız ortam değişkeni
+# adlarıyla durur; hiçbirinin karşılığı yoktur.
+# ─────────────────────────────────────────────────────────────────────────────
+spring:
+  application:
+    name: waydee-backend
+
+  # Kök .env (docker compose'un da okuduğu dosya) yerelde Spring'e de aktarılır:
+  # TURNSTILE_SECRET gibi gizli değerler koda değil bu dosyaya yazılır.
+  # "optional:" → dosya yoksa uygulama yine açılır (üretimde gerçek env kullanılır).
+  # Sonraki import öncekini EZER: .env "gerçek" değerler, .env.local yereldeki
+  # kişisel geçersiz kılmalar (Turnstile test anahtarı gibi) içindir.
+  config:
+    import:
+      - optional:file:.env[.properties]
+      - optional:file:../.env[.properties]
+      - optional:file:../../.env[.properties]
+      - optional:file:.env.local[.properties]
+      - optional:file:../.env.local[.properties]
+      - optional:file:../../.env.local[.properties]
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5442/waydee}
+    username: ${DB_USERNAME:}
+    password: ${DB_PASSWORD:}
+    hikari:
+      # Yük altında 10 bağlantı hızla tükenir; varsayılan 20, ortamdan büyütülebilir.
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      minimum-idle: 2
+      connection-timeout: 10000
+
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc.time_zone: UTC
+        default_batch_fetch_size: 50
+
+  flyway:
+    # 🔴 Çok task'a geçerken KAPATILABİLİR olmalı (ölçek analizi bulgusu C6).
+    #
+    # Migration açılışta koşuyor. Tek task varken sorun değil, ama N task aynı
+    # anda açılınca hepsi Flyway kilidinde sıraya girer: birincisi göç ederken
+    # diğerleri bekler, açılış süresi uzar ve ECS'in grace period'unu zorlar.
+    #
+    # Doğru düzen: göçü CI'da TEK SEFERLİK bir ECS task'ı olarak koştur, sonra
+    # uygulama task'larını FLYWAY_ENABLED=false ile başlat.
+    # ⚠️ Varsayılan `true` — bu bayrak CI adımı yazılmadan kapatılırsa şema
+    # hiç göç etmez ve uygulama `validate` hatasıyla düşer.
+    enabled: ${FLYWAY_ENABLED:true}
+    locations: classpath:db/migration
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6390}
+      password: ${REDIS_PASSWORD:}
+      # 🔴 Kısa timeout: Redis yavaşlarsa istek thread'leri asılı kalmasın.
+      # 800ms'den 250ms'ye indirildi (14 Ağu 2026, ÖLÇÜLDÜ). Redis durdurulup
+      # /map/regions çağrıldığında istek 2,45 sn sürüyordu: tek bir istek bu
+      # timeout'u ÜÇ KEZ ödüyor (hız sınırı okuması + önbellek okuma + önbellek
+      # yazma). Redis bu projede hızlandırıcıdır, veri kaynağı değil — erişilemezse
+      # hızlıca vazgeçip veritabanına gitmek doğrusudur.
+      # ⚠️ Daha da düşürme: ElastiCache TLS el sıkışması ilk bağlantıda birkaç on
+      # milisaniye alır, çok agresif bir değer sağlıklı Redis'i "yavaş" sanır.
+      # 🔴🔴 17 Ağu 2026 — SABİT 250ms ÜRETİMİ ÇÖKERTTİ (ölçüldü, 92. tur).
+      #
+      # Sıfırdan açılan bir task'ta uygulama şu hatayla ölüyordu:
+      #   Failed to start bean 'clusterListenerContainer'
+      #   → RedisCommandTimeoutException: Connection initialization
+      #     timed out after 250 millisecond(s)
+      #
+      # SEBEP: `clusterListenerContainer` (K3 · Redis Pub/Sub yayını, 80. tur)
+      # bir Spring **lifecycle** bean'idir. Hız sınırı ve önbellek fail-open
+      # tasarlandı, ama bu bean değil: bağlanamazsa **uygulama hiç açılmaz**.
+      # SOĞUK bir task'ta DNS çözümü + ElastiCache **TLS el sıkışması** 250ms'ye
+      # sığmıyor. Sıcak süreçte sığıyor → hata **yalnız yeniden başlatmada**
+      # görünüyor ve deploy'ların bir kısmı şansa geçiyordu (ölçüldü: aynı
+      # anda bir rev2 task'ı ayakta kalırken diğerleri crash loop'taydı).
+      #
+      # ⚠️ Bu yüzden değer artık SABİT DEĞİL, ortamdan verilebilir. Üretimde
+      # ECS görev tanımında `SPRING_DATA_REDIS_TIMEOUT=3s` ve
+      # `SPRING_DATA_REDIS_CONNECT_TIMEOUT=5s` tanımlıdır (rev 3).
+      # ⚠️ Komut zaman aşımı ile BAĞLANTI zaman aşımı ayrıldı: istek yolunun
+      # hızlı vazgeçmesi doğruydu (14 Ağu ölçümü geçerli), ama o karar
+      # açılıştaki el sıkışmasını da kısıtlıyordu — ikisi aynı şey değil.
+      timeout: ${REDIS_TIMEOUT:3s}
+      connect-timeout: ${REDIS_CONNECT_TIMEOUT:5s}
+      # ⚠️ AWS ElastiCache "encryption in transit" AÇIKKEN düz TCP bağlantısını
+      # REDDEDER. Yerel docker Redis'i ise TLS konuşmaz — bu yüzden varsayılan
+      # false, üretimde REDIS_SSL=true verilir.
+      # 🔴 Bu bayrak unutulursa uygulama AÇILIR ama her Redis çağrısı düşer;
+      # rate limit ve cache "fail-open" tasarlandığı için HATA GÖRÜNMEZ.
+      ssl:
+        enabled: ${REDIS_SSL:false}
+
+  # 🔴 15 Ağu 2026 — VİDEO/SES için tavan yükseltildi (3B mağaza stüdyosu).
+  #
+  # ⚠️ BU TAVAN ÜÇ YERDE TUTARLI OLMALI:
+  #   ① burası, ② `MediaService` (tür başına gerçek sınır: görsel 10 MB,
+  #   video 60 MB, ses 15 MB), ③ `frontend/nginx.conf` → `client_max_body_size`.
+  #
+  # En küçüğü hangisiyse gerçek sınır odur. Buradaki değer 10 MB kalsaydı
+  # 60 MB'lık video isteği `MediaService`e HİÇ ULAŞMAZ ve kullanıcı bizim
+  # anlaşılır hata mesajımızı değil, ham bir 413 görürdü.
+  #
+  # ⚠️ Buradaki tavan bilinçli olarak GEVŞEK: asıl tür bazlı kontrol
+  # `MediaService`te yapılıyor. Burada 60 MB yazmak, ses için de 60 MB'a
+  # izin vermek anlamına gelmez.
+  servlet:
+    multipart:
+      max-file-size: 60MB
+      max-request-size: 70MB
+
+  # SMTP — hesap doğrulama / şifre sıfırlama e-postaları.
+  # Gmail (Google Workspace) uygulama şifresi ile kullanılır; şifre KODA YAZILMAZ,
+  # kök .env'den (yerel) ya da Dokploy ortam değişkeninden (üretim) gelir.
+  mail:
+    host: ${MAIL_HOST:smtp.gmail.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USERNAME:}
+    password: ${MAIL_PASSWORD:}
+    properties:
+      mail:
+        smtp:
+          auth: true
+          # 587 = STARTTLS. 465 kullanılacaksa MAIL_SMTP_SSL=true yapılmalı.
+          starttls:
+            enable: ${MAIL_STARTTLS:true}
+            required: ${MAIL_STARTTLS:true}
+          ssl:
+            enable: ${MAIL_SMTP_SSL:false}
+          # SMTP yavaşsa async gönderim thread'i sonsuza kadar asılı kalmasın.
+          connectiontimeout: 10000
+          timeout: 10000
+          writetimeout: 10000
+
+server:
+  port: ${SERVER_PORT:8091}
+  forward-headers-strategy: framework
+  compression:
+    enabled: true
+    mime-types: application/json,application/geo+json
+
+management:
+  # 🔴 SAĞLIK KONTROLÜ AYRI PORTA ALINABİLİR — ölçek analizi bulgusu K4.
+  #
+  # Varsayılan olarak yönetim ucu uygulamayla AYNI portta (bugünkü davranış).
+  # `MANAGEMENT_PORT=8092` verilirse Spring yönetim uçlarına AYRI bir Tomcat
+  # bağlamı (ve AYRI thread havuzu) açar.
+  #
+  # NEDEN: aynı porttayken `/actuator/health` de uygulamanın 200 thread'ini
+  # paylaşır. Yük binip thread'ler tükendiğinde sağlık kontrolü de cevap
+  # veremez → ALB "sağlıksız" der → ECS ÇALIŞAN TEK TASK'I ÖLDÜRÜR → yeniden
+  # açılır → aynı yük → sonsuz çökme döngüsü. Yavaşlama değil, TAM KESİNTİ.
+  #
+  # 🔴 BAYRAĞI AÇMADAN ÖNCE AWS TARAFINDA ÜÇ ŞEY GEREKİR (sırayla):
+  #   1. ECS task tanımına 8092 portMapping eklenecek
+  #   2. `waydee-app` güvenlik grubuna ALB'den 8092'ye izin
+  #   3. `tg-backend` hedef grubunda sağlık kontrolü portu → 8092
+  # Üçü yapılmadan MANAGEMENT_PORT verilirse sağlık kontrolü 404 alır ve
+  # servis ayağa kalkmaz. Bu yüzden varsayılan KAPALI (REDIS_SSL ile aynı desen).
+  # 🔴 Varsayılan `${server.port}` — ORTAM DEĞİŞKENİ DEĞİL, ÇÖZÜLMÜŞ ÖZELLİK.
+  # Önce `${MANAGEMENT_PORT:${SERVER_PORT:8091}}` yazılmıştı ve bu HATALIYDI:
+  # uygulama portu `--server.port=8093` gibi bir ÖZELLİKLE verilirse `SERVER_PORT`
+  # ortam değişkeni boş kalır, yönetim portu sabit 8091'e düşer ve uygulama
+  # sessizce İKİ PORTA bölünür. (14 Ağu 2026'da iki örnek çalıştırılırken
+  # gerçekten yaşandı: ikinci örnek 8093 + 8091 açtı, birincisi bağlanamadı.)
+  server:
+    port: ${MANAGEMENT_PORT:${server.port}}
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      probes:
+        enabled: true
+
+springdoc:
+  # 🔴 17 Ağu 2026 — varsayılan kapalı (bkz. waydee.security.swagger-enabled).
+  api-docs:
+    enabled: ${SWAGGER_ENABLED:false}
+  swagger-ui:
+    enabled: ${SWAGGER_ENABLED:false}
+    path: /swagger-ui.html
+
+# ══════════════════════════════════════════════════════════════════════
+# 🔴 GÜNLÜKLEME — 20 Ağustos 2026
+#
+# <b>Üç katmanlı yapının 1. katmanı</b> (diğerleri: `audit_log` tablosu =
+# "kim ne yaptı", Actuator/Micrometer = "kaç tane, ne kadar hızlı").
+# ⚠️ SAYISAL OLAN ŞEY LOG DEĞİL METRİKTİR. "Kaç istek geldi" sorusunu log
+# satırı sayarak cevaplamak, log hacmini şişiren asıl hatadır.
+#
+# <b>Neden yapısal (JSON):</b> düz metin CloudWatch Insights'ta alan bazlı
+# sorgulanamaz. JSON ile `filter userId="..." and status>=500` yazılabiliyor.
+#
+# 🔴 <b>EK BAĞIMLILIK YOK.</b> Spring Boot 3.4'ten beri yapısal günlükleme
+# YERLEŞİK (`logging.structured.format.*`). Projede 3.5.6 var, yani
+# logstash-encoder gibi bir kütüphaneye gerek kalmadı — bir bağımlılık
+# eklememek, bakımı olmayan bir bağımlılık demektir.
+#
+# ⚠️ Biçim PROFİLE bağlı: üretimde `ecs` (JSON), yerelde okunabilir metin.
+# Geliştiricinin konsolunda JSON, hata ayıklamayı zorlaştırırdı.
+# ⚠️ MDC alanları (requestId · userId · ip) JSON'a KENDİLİĞİNDEN girer;
+# `RequestLogFilter` onları koyar, biçimlendirici yazar.
+logging:
+  level:
+    com.waydee: ${LOG_LEVEL_WAYDEE:INFO}
+    # ── gürültü kısma (canlı logdan ÖLÇÜLDÜ) ────────────────────────────
+    # Bu satır 30 dakikada bir DEVASA bir istatistik bloğu yazıyordu ve
+    # hiçbir kararı beslemiyordu; aynı bilgi Actuator metriklerinde var.
+    org.springframework.web.socket.config.WebSocketMessageBrokerStats: WARN
+    # ⚠️ `HHH90003004` (firstResult/maxResults + collection fetch) SUSTURULMADI.
+    # O bir GERÇEK sorundur: sayfalama bellekte yapılıyor. Susturmak, sorunu
+    # görünmez kılmak olurdu — kaydı [[12-tuzaklar]]'a düşüldü.
+  structured:
+    format:
+      console: ${LOG_FORMAT:}
+  # ⚠️ Yerel geliştirmede (LOG_FORMAT boş) bu desen geçerli olur; `ecs`
+  # seçiliyken Spring bunu yok sayar.
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %-5level [%X{requestId:-}] %logger{36} - %msg%n"
+
+waydee:
+  logging:
+    # Bu süreyi aşan istek WARN olur. Eşik bir İŞ KARARIDIR ve trafik
+    # büyüdükçe değişir; kod değiştirip dağıtmak gerekmesin diye ayarlanabilir.
+    slow-request-ms: ${SLOW_REQUEST_MS:500}
+
+  # 🔴 GÖRSEL ANALİZİ / ÜRÜN ALGILAMA — 10 Ağu 2026.
+  #
+  # İki katman vardır ve sıra şudur:
+  #   1) `vision` — GERÇEK ürün algılama (görsel-dil modeli). Kutu + AD döner,
+  #      etiket ürünün merkezine oturur ve form önceden dolar.
+  #      ⚠️ `api-key` boşken bu katman HİÇ ÇALIŞMAZ (sessizce atlanır).
+  #   2) yerleşik dikkat haritası — anahtarsız çalışan yedek. Nesneyi TANIMAZ,
+  #      yalnız "dikkat çeken bölge"nin merkezini verir.
+  #
+  # ⚠️ Uç OpenAI uyumlu `/chat/completions` sözleşmesidir; OpenAI, OpenRouter,
+  # Groq, Together ve yerel bir vLLM/Ollama sunucusu da bunu konuşur. Sağlayıcı
+  # değiştirmek için yalnız `base-url` + `model` yeter.
+  # 🔒 Anahtar KODA YAZILMAZ — kök .env / Dokploy Environment'tan gelir.
+  ai:
+    vision:
+      enabled: ${VISION_ENABLED:true}
+      base-url: ${VISION_BASE_URL:https://api.openai.com/v1}
+      api-key: ${VISION_API_KEY:}
+      model: ${VISION_MODEL:gpt-4o-mini}
+      timeout-seconds: ${VISION_TIMEOUT:25}
+    # 🔴 GÖRSEL ÜRETİMİ (fal.ai) — 16 Ağu 2026, V45.
+    #
+    # "Fast Model": kullanıcının ürün fotoğraflarını yapay zekâ mankeni üzerinde
+    # giydirir. Sözleşme KUYRUK API'sidir (gönder → yokla → sonucu al); eşzamanlı
+    # `fal.run` ucu bir Tomcat thread'ini 6–40 saniye bloke ederdi.
+    #
+    # ⚠️ `model` çok görselli bir DÜZENLEME modeli olmalı (girdi olarak ürün
+    # fotoğraflarını alır). `upscale-model` yalnız "yüksek kalite" seçilince,
+    # ikinci geçiş olarak çağrılır ve başarısızlığı üretimi düşürmez —
+    # aradaki kredi farkı iade edilir.
+    #
+    # 🔒 Anahtar KODA YAZILMAZ — kök `.env` / AWS Secrets Manager'dan gelir.
+    # Anahtar boşken stüdyo uçları hata döner ve KREDİ DÜŞMEZ.
+    fal:
+      enabled: ${FAL_ENABLED:true}
+      base-url: ${FAL_BASE_URL:https://queue.fal.run}
+      # 🔴 Girdi görselleri BURAYA yüklenir ve modele ADRESLE verilir.
+      # Data URI ile göndermek 422 `no_media_generated` veriyor ve sağlayıcı
+      # sebebi söylemiyor — izole ölçüldü, gerekçe `FalClient.uploadImage`ta.
+      storage-url: ${FAL_STORAGE_URL:https://rest.alpha.fal.ai}
+      api-key: ${FAL_API_KEY:}
+      model: ${FAL_MODEL:fal-ai/nano-banana/edit}
+      upscale-model: ${FAL_UPSCALE_MODEL:fal-ai/esrgan}
+      # ⚠️ Bu tavan, `AiGenerationSweeper.STUCK_MINUTES` (20 dk) değerinden
+      # BELİRGİN biçimde küçük kalmalı; aksi halde süpürme hâlâ çalışan bir
+      # üretimi iade eder ve iş bedavaya gelirdi.
+      timeout-seconds: ${FAL_TIMEOUT:240}
+  # 🔴 ARAMA MOTORU (SEO) — 9 Ağu 2026.
+  #
+  # `site-url` **dış dünyanın gördüğü** kök adrestir; sitemap ve canonical
+  # bağlantıları buradan kurulur. APP_BASE_URL ile aynı olmalıdır; ayrı bir
+  # anahtar olmasının sebebi, ileride vitrinin ayrı bir alan adına taşınabilmesi.
+  #
+  # ⚠️ `enabled: false` iken robots.txt **tüm siteyi kapatır** (`Disallow: /`)
+  # ve prerender hiçbir şey döndürmez. Sahne/kopya ortamların canlı site ile
+  # aynı içeriği indeksletmesi (duplicate content) böyle engellenir.
+  seo:
+    enabled: ${SEO_ENABLED:true}
+    site-url: ${SEO_SITE_URL:${APP_BASE_URL:http://localhost:5175}}
+    # Site haritası sayfa boyu — Google'ın tavan sınırı 50.000 URL / 50 MB.
+    sitemap-page-size: ${SEO_SITEMAP_PAGE_SIZE:5000}
+  # 🔴 8 Ağu 2026 — ÖZELLİK ANAHTARLARI. Mesajlaşma ve keşfet **şimdilik
+  # kapatıldı** (kullanıcı isteği). Kapatma yöntemi bilinçli olarak
+  # **yapılandırma**dır, kod silmek değil:
+  #   · Kod silinseydi geri açmak bir sürüm işi olurdu; burada tek satır.
+  #   · Uçlar `@ConditionalOnProperty` ile hiç kaydedilmez → **404**.
+  #     Bu, "kapalı özellik 404 döner" ilkesinin aynısıdır (Google girişi de böyle).
+  #   · Arayüz de aynı anda gizlenir; yalnız birini kapatmak, tıklayınca hata
+  #     veren bir düğme ya da açıkta kalan bir uç bırakırdı.
+  # ⚠️ `explore.enabled` **`/explore` ile birlikte `/feed`'i de** kapatır
+  # (ikisi aynı controller'da). `/feed` istemcide hiç kullanılmıyor — ölçüldü.
+  features:
+    messaging:
+      enabled: ${MESSAGING_ENABLED:false}
+    explore:
+      enabled: ${EXPLORE_ENABLED:false}
+  security:
+    jwt:
+      # Dev varsayılanı — üretimde JWT_SECRET ortam değişkeni zorunludur (>= 64 bayt, Base64).
+      secret: ${JWT_SECRET:}
+      issuer: waydee
+      access-token-ttl: 15m
+      refresh-token-ttl: 14d
+    cors:
+      # Kullanıcı uygulaması (5175) ve yönetim uygulaması (5176) — başka origin kabul edilmez.
+      allowed-origins: ${CORS_ORIGINS:http://localhost:5175,http://127.0.0.1:5175,http://localhost:5176,http://127.0.0.1:5176}
+    # API dokümanı üretimde kapalıdır; yalnızca geliştirme için açılır.
+    # 🔴 17 Ağu 2026 — varsayılan `true`dan `false`a çekildi. Açık uç bir
+    # yapılandırma HATASIYLA doğmamalı: `SWAGGER_ENABLED` unutulan bir ortamda
+    # eski varsayılan tüm API şemasını yayınlıyordu ve bunu yalnız `prod`
+    # profilindeki guard yakalıyordu (sahne/kopya ortamlar korumasızdı).
+    swagger-enabled: ${SWAGGER_ENABLED:false}
+    # 🔴 17 Ağu 2026 — GERÇEK İSTEMCİ IP'Sİ: X-Forwarded-For zincirinin
+    # SAĞINDAN kaç girdi bize ait vekillerce eklenir.
+    #   0 → XFF hiç okunmaz (yerel geliştirme, doğrudan erişim)
+    #   1 → tek yük dengeleyici (bugünkü AWS ALB kurulumu)
+    #   2 → Cloudflare → ALB gibi iki katmanlı kurulum
+    # ⚠️ Verilmezse eski `waydee.rate-limit.trust-forwarded` bayrağından
+    # türetilir (true → 1), böylece üretim env değişikliği olmadan düzelir.
+    # ⚠️ FAZLA vermek TEHLİKELİDİR: zincir beklenenden kısaysa saldırganın
+    # yazdığı girdiye kayılır. Az vermek yalnız vekilin IP'sini gösterir.
+    trusted-proxy-hops: ${TRUSTED_PROXY_HOPS:-1}
+    turnstile:
+      # Cloudflare bot koruması. Kapalıyken (offline geliştirme) doğrulama atlanır.
+      enabled: ${TURNSTILE_ENABLED:false}
+      # ⚠️ Gizli anahtar KOD İÇİNDE DURMAZ — kök .env'den / ortamdan gelir.
+      secret-key: ${TURNSTILE_SECRET:}
+      verify-url: ${TURNSTILE_VERIFY_URL:https://challenges.cloudflare.com/turnstile/v0/siteverify}
+      timeout: 5s
+  oauth:
+    google:
+      # Kapalıyken uçlar 404 döner ve arayüz "Google ile devam et" düğmesini
+      # HİÇ çizmez (`GET /config` → googleAuthEnabled). Yarım yapılandırma da
+      # kapalı sayılır — tıklayınca hata veren bir düğme göstermeyiz.
+      enabled: ${GOOGLE_OAUTH_ENABLED:false}
+      # Google Cloud Console → API ve Servisler → Kimlik Bilgileri → OAuth istemci.
+      # ⚠️ client-secret KODA YAZILMAZ; kök .env / Dokploy Environment'tan gelir.
+      client-id: ${GOOGLE_CLIENT_ID:}
+      client-secret: ${GOOGLE_CLIENT_SECRET:}
+      # ⚠️ Console'daki "Yetkili yönlendirme URI'leri" ile BİREBİR aynı olmalı —
+      # tek karakter farkı Google tarafında redirect_uri_mismatch verir.
+      redirect-uri: ${GOOGLE_REDIRECT_URI:http://localhost:8091/api/v1/auth/google/callback}
+      # Akışın döneceği KULLANICI ARAYÜZÜ kökü (APP_BASE_URL ile aynı olmalı).
+      app-base-url: ${APP_BASE_URL:http://localhost:5175}
+      # Yetkilendirme isteğinin geçerlilik penceresi (CSRF koruması).
+      state-ttl: ${GOOGLE_STATE_TTL:10m}
+      # Dönüşte üretilen tek kullanımlık takas biletinin ömrü. Kısa olmalı:
+      # tarayıcı yönlendirmeden sonra saniyeler içinde POST eder.
+      ticket-ttl: ${GOOGLE_TICKET_TTL:2m}
+  storage:
+    endpoint: ${MINIO_ENDPOINT:http://localhost:9010}
+    access-key: ${MINIO_ACCESS_KEY:}
+    secret-key: ${MINIO_SECRET_KEY:}
+    bucket: ${MINIO_BUCKET:waydee-media}
+    # Boş = yerel MinIO. AWS S3'e bağlanırken bölge adı ZORUNLUDUR.
+    region: ${MINIO_REGION:}
+    # 🔴 Medya baytları backend'in İÇİNDEN AKMASIN — imzalı depo adresine 302.
+    # Kapatmak yalnız deponun tarayıcıdan erişilemediği kurulumlarda gerekir.
+    direct-delivery: ${MEDIA_DIRECT_DELIVERY:true}
+  mapbox:
+    # Yalnız YEDEK değer. Asıl anahtar `app_settings` tablosunda tutulur ve admin
+    # panelinden değiştirilir (değişiklik WS ile anında yayılır). DB boşsa bu kullanılır.
+    # ⚠️ Yalnız GENEL (pk.) anahtar — bu değer tarayıcıya servis edilir.
+    access-token: ${MAPBOX_ACCESS_TOKEN:}
+  mail:
+    # Kapalıyken hiçbir e-posta gönderilmez; doğrulama bağlantısı sunucu log'una
+    # basılır (SMTP'siz offline geliştirme bu sayede tam akışla çalışır).
+    enabled: ${MAIL_ENABLED:false}
+    # Gmail başka bir adres adına göndermeye izin vermez → MAIL_USERNAME ile aynı olmalı.
+    from: ${MAIL_FROM:noreply@waydee.com}
+    from-name: ${MAIL_FROM_NAME:Waydee}
+    # Doğrulama/sıfırlama bağlantılarının kurulduğu KULLANICI ARAYÜZÜ kök adresi.
+    # Üretimde https://waydee.com gibi gerçek alan adı verilmelidir.
+    base-url: ${APP_BASE_URL:http://localhost:5175}
+    verification-ttl: ${MAIL_VERIFICATION_TTL:24h}
+    # Şifre sıfırlama bilinçli olarak kısa ömürlüdür.
+    password-reset-ttl: ${MAIL_RESET_TTL:1h}
+  payment:
+    # mock → sahte ödeme ekranı (yerel geliştirme) · polar → gerçek tahsilat.
+    # ⚠️ prod profilinde mock seçilirse uygulama AÇILMAZ (bedava bölge dağıtılmasın)
+    #    — bilerek istiyorsanız aşağıdaki allow-mock bayrağını da açın.
+    provider: ${PAYMENT_PROVIDER:mock}
+    # Üretimde sahte ödemeye BİLİNÇLİ izin (canlı ortamda uçtan uca test için).
+    # true iken prod profilinde provider=mock kabul edilir; açılışta uyarı loglanır.
+    # Gerçek tahsilata dönerken: PAYMENT_PROVIDER=polar + PAYMENT_ALLOW_MOCK=false
+    allow-mock: ${PAYMENT_ALLOW_MOCK:false}
+    # Ödeme sayfası açıkken dairenin rezerve kalacağı süre. Çok kısa olursa
+    # kullanıcı kart bilgisi girerken alanı kaybeder; çok uzun olursa vazgeçen
+    # biri alanı gereksiz kilitler.
+    reservation-ttl: ${PAYMENT_RESERVATION_TTL:30m}
+    # Ödemeden sonra kullanıcının döneceği ARAYÜZ adresi.
+    # ⚠️ Varsayılanı APP_BASE_URL'den TÜRETİR. Ayrı bir env olarak durduğu sürece
+    # alan adı taşınırken atlanıyordu: 72. turda APP_BASE_URL waydee.com'a
+    # çekildi ama bu satır `https://app.waydee.com/payment/return` kaldı ve plan
+    # satın alan herkes eski alan adına düşürüldü (11 Ağu 2026'da ölçüldü).
+    # Artık PAYMENT_RETURN_URL yalnız gerçekten FARKLI bir dönüş sayfası
+    # gerekiyorsa verilir; verilmezse kök adres neredeyse dönüş de oradadır.
+    return-url: ${PAYMENT_RETURN_URL:${APP_BASE_URL:http://localhost:5175}/payment/return}
+    # 🔴 Polar (12 Ağu 2026 — LemonSqueezy tamamen kaldırıldı).
+    polar:
+      # Organizasyon erişim jetonu (polar_oat_…). Gereken izinler:
+      # checkouts:write · checkouts:read · products:read · orders:read
+      # subscriptions:read · customer_portal:write
+      api-key: ${POLAR_API_KEY:}
+      # production | sandbox — sandbox AYRI bir hesaptır, ürün kimlikleri de farklıdır.
+      server: ${POLAR_SERVER:production}
+      # Standard Webhooks imzasının doğrulandığı sır. Boşsa hiçbir bildirim kabul edilmez.
+      webhook-secret: ${POLAR_WEBHOOK_SECRET:}
+      # 🔴 DÖRT AYRI ÜRÜN. LemonSqueezy'de tek varyant yetiyordu çünkü fiyat
+      # custom_price ile eziliyordu; Polar'da abonelik ürününün fiyatı ezilemez.
+      # ⚠️ Yıllık ürünlere YILLIK TOPLAM girilir (aylık eşdeğer × 12):
+      #    Pro 13/ay · 120/yıl · Premium 30/ay · 300/yıl
+      product-pro-monthly: ${POLAR_PRODUCT_PRO_MONTHLY:}
+      product-pro-yearly: ${POLAR_PRODUCT_PRO_YEARLY:}
+      product-premium-monthly: ${POLAR_PRODUCT_PREMIUM_MONTHLY:}
+      product-premium-yearly: ${POLAR_PRODUCT_PREMIUM_YEARLY:}
+  # 🔴 17 Ağu 2026 — PLAN LİMİTLERİ ORTAMDAN AYARLANABİLİR.
+  # Ücretsiz planın haftalık gönderi tavanı UserPlan enum'una gömülüydü;
+  # değiştirmek kod + derleme + dağıtım demekti. Oysa bu bir İŞ KARARIDIR.
+  # Ölçüldü (17 Ağu): 32 kayıtlı kullanıcı, toplam 1 gönderi — ilk gönderisini
+  # atan herkes duvara çarpıyor ve bunu bir arıza sanıyor.
+  # Boş = enum'daki değer (bugün 1). -1 = sınırsız.
+  plans:
+    free-weekly-posts: ${FREE_WEEKLY_POSTS:}
+  territory:
+    # Mobilde küçük alanlar da alınabilsin diye taban 10 m.
+    min-radius-m: 10
+    max-radius-m: 50000
+  rate-limit:
+    enabled: ${RATE_LIMIT_ENABLED:true}
+    # X-Forwarded-For YALNIZ güvenilir LB/proxy arkasında true yapılır; aksi halde spoof edilir.
+    trust-forwarded: ${TRUST_FORWARDED_HEADER:false}
